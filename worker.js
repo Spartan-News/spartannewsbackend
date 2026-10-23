@@ -39,7 +39,114 @@ export default {
     }
 
     // -------------------------------------------------------------------------
-    // 1. YOUTUBE CHANNEL FEED PROXY (/youtube-feed)
+    // 1. YOUTUBE LIVE STATUS AND UPCOMING STREAMS
+    // -------------------------------------------------------------------------
+    if (url.pathname === "/check-live" || url.pathname === "/upcoming-streams") {
+      if (request.method !== "GET") return json({ error: "GET only" }, 405, corsHeaders);
+
+      const handle = (url.searchParams.get("handle") || "SpartanNewsLive").replace(/^@/, "");
+      if (handle.toLowerCase() !== "spartannewslive") {
+        return json({ error: "Unsupported YouTube channel" }, 400, corsHeaders);
+      }
+
+      const apiKey = env.YOUTUBE_API_KEY || env.VITE_YOUTUBE_API_KEY;
+      if (!apiKey) {
+        return json({ error: "Missing YOUTUBE_API_KEY in Worker env" }, 500, corsHeaders);
+      }
+
+      try {
+        const isUpcomingRequest = url.pathname === "/upcoming-streams";
+        const eventType = isUpcomingRequest ? "upcoming" : "live";
+        const searchUrl = new URL("https://www.googleapis.com/youtube/v3/search");
+        searchUrl.search = new URLSearchParams({
+          part: "snippet",
+          channelId: "UCMbRanNiBOBeop8qZkBAwlA",
+          eventType,
+          maxResults: "25",
+          type: "video",
+          videoEmbeddable: "true",
+          key: apiKey,
+        }).toString();
+
+        const searchData = await fetchYouTubeApiJson(
+          searchUrl.toString(),
+          `streams-${eventType}-UCMbRanNiBOBeop8qZkBAwlA`,
+          isUpcomingRequest ? 3600 : 300,
+          ctx
+        );
+        const searchItems = searchData.items || [];
+
+        if (!isUpcomingRequest) {
+          const stream = searchItems[0];
+          return json(
+            {
+              isLive: Boolean(stream),
+              videoId: stream ? stream.id.videoId : null,
+              title: stream ? stream.snippet.title : "",
+            },
+            200,
+            { ...corsHeaders, "Cache-Control": "public, max-age=30" }
+          );
+        }
+
+        const videoIds = searchItems
+          .map((item) => item.id && item.id.videoId)
+          .filter(Boolean);
+
+        if (!videoIds.length) {
+          return json({ items: [] }, 200, { ...corsHeaders, "Cache-Control": "public, max-age=60" });
+        }
+
+        const detailsUrl = new URL("https://www.googleapis.com/youtube/v3/videos");
+        detailsUrl.search = new URLSearchParams({
+          part: "liveStreamingDetails",
+          id: videoIds.join(","),
+          key: apiKey,
+        }).toString();
+        const detailsData = await fetchYouTubeApiJson(
+          detailsUrl.toString(),
+          `stream-details-${videoIds.sort().join(",")}`,
+          3600,
+          ctx
+        );
+        const startTimes = new Map(
+          (detailsData.items || []).map((video) => [
+            video.id,
+            video.liveStreamingDetails && video.liveStreamingDetails.scheduledStartTime,
+          ])
+        );
+        const now = Date.now();
+        const items = searchItems
+          .map((item) => {
+            const scheduledStartTime = startTimes.get(item.id.videoId);
+            if (!scheduledStartTime || Date.parse(scheduledStartTime) <= now) return null;
+
+            return {
+              id: item.id.videoId,
+              title: item.snippet.title,
+              scheduledStartTime,
+              scheduledTime: new Intl.DateTimeFormat("en-US", {
+                weekday: "short",
+                month: "short",
+                day: "numeric",
+                hour: "numeric",
+                minute: "2-digit",
+                timeZone: "America/Detroit",
+              }).format(new Date(scheduledStartTime)),
+            };
+          })
+          .filter(Boolean)
+          .sort((a, b) => Date.parse(a.scheduledStartTime) - Date.parse(b.scheduledStartTime));
+
+        return json({ items }, 200, { ...corsHeaders, "Cache-Control": "public, max-age=60" });
+      } catch (err) {
+        console.error("YouTube live data request failed:", err);
+        return json({ error: err.message || "YouTube live data request failed" }, 502, corsHeaders);
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. YOUTUBE CHANNEL FEED PROXY (/youtube-feed)
     // -------------------------------------------------------------------------
     if (url.pathname === "/youtube-feed") {
       try {
@@ -99,7 +206,7 @@ export default {
     }
 
     // -------------------------------------------------------------------------
-    // 2. SCHEDULE / SCORES (/check-scores)
+    // 3. SCHEDULE / SCORES (/check-scores)
     // -------------------------------------------------------------------------
     if (url.pathname === "/check-scores") {
       try {
@@ -123,7 +230,7 @@ export default {
     }
 
     // -------------------------------------------------------------------------
-    // 3. ADMIN API (/admin/api/games)
+    // 4. ADMIN API (/admin/api/games)
     // -------------------------------------------------------------------------
     if (url.pathname === "/admin/api/games") {
       const adminHeaders = { ...corsHeaders, "Cache-Control": "no-store" };
@@ -182,7 +289,7 @@ export default {
     }
 
     // -------------------------------------------------------------------------
-    // 4. ANDROID PIN / UNPIN (/pin, /unpin)
+    // 5. ANDROID PIN / UNPIN (/pin, /unpin)
     // -------------------------------------------------------------------------
     if (url.pathname === "/pin" || url.pathname === "/unpin") {
       if (request.method !== "POST") return json({ error: "POST only" }, 405, corsHeaders);
@@ -226,7 +333,7 @@ export default {
     }
 
     // -------------------------------------------------------------------------
-    // 5. YOUTUBE LIVE WEBHOOK NOTIFIER (/youtube-webhook)
+    // 6. YOUTUBE LIVE WEBHOOK NOTIFIER (/youtube-webhook)
     // -------------------------------------------------------------------------
     if (url.pathname === "/youtube-webhook") {
       if (request.method === "GET") {
@@ -276,9 +383,37 @@ export default {
       }
     }
 
-    return json({ message: "Spartan News API Worker Active" }, 200, corsHeaders);
+    return json({ error: "Not found" }, 404, corsHeaders);
   },
 };
+
+async function fetchYouTubeApiJson(url, cacheId, maxAgeSeconds, ctx) {
+  const cache = caches.default;
+  const cacheKey = new Request(`https://shsnews.live/__youtube_cache/${encodeURIComponent(cacheId)}`);
+  const cached = await cache.match(cacheKey);
+  if (cached) return cached.json();
+
+  const response = await fetch(url);
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    throw new Error("YouTube API returned an invalid response");
+  }
+
+  if (!response.ok || data.error) {
+    throw new Error(data.error && data.error.message ? data.error.message : `YouTube API error (${response.status})`);
+  }
+
+  const cacheResponse = new Response(JSON.stringify(data), {
+    headers: {
+      "Content-Type": "application/json",
+      "Cache-Control": `public, max-age=${maxAgeSeconds}`,
+    },
+  });
+  ctx.waitUntil(cache.put(cacheKey, cacheResponse));
+  return data;
+}
 
 // -----------------------------------------------------------------------------
 // SUPABASE AUTHENTICATION
