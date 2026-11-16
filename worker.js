@@ -7,6 +7,7 @@ const HUDL_GRAPHQL_URL = "https://www.hudl.com/api/public/graphql/query";
 const HUDL_SCHOOL_ID = "6979";
 const GOOGLE_CALENDAR_ID = "fce03f2af58e6d303b610da3df6e39245d0e7e8a4bbbe0ce5655d48cfd807584@group.calendar.google.com";
 const SPARTAN_LIVE_CHANNEL_ID = "UCMbRanNiBOBeop8qZkBAwlA";
+const YOUTUBE_WEBHOOK_CALLBACK = "https://noti.router.app.shsnews.live/youtube-webhook";
 
 const GAMES = [
   {
@@ -27,6 +28,16 @@ const SUB_RE = /^[0-9a-fA-F-]{36}$/;
 const MAX_PINS_PER_GAME = 2000;
 
 export default {
+  async scheduled(event, env, ctx) {
+    const tasks = [
+      refreshHudlLiveActivities(env, ctx),
+      ensureYoutubeWebhookSubscriptions(env, ctx),
+    ];
+    // PubSub sends prompt upload/live callbacks; the API check is a low-frequency fallback.
+    if (event.cron === "*/15 * * * *") tasks.push(refreshYouTubeLiveNotification(env, ctx));
+    ctx.waitUntil(Promise.all(tasks));
+  },
+
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     url.pathname = url.pathname.replace(/\/+$/, "") || "/";
@@ -393,34 +404,7 @@ export default {
 
               // Upcoming broadcasts should alert users only once they are actually live.
               if (videoInfo?.snippet?.liveBroadcastContent !== "upcoming") {
-                const kind = isLive ? "live" : "upload";
-                const marker = new Request(`https://shsnews.live/__youtube_notified/${videoId}/${kind}`);
-                const cache = caches.default;
-                if (!(await cache.match(marker))) {
-                  const targetUrl = isLive
-                    ? `https://shsnews.live/live?v=${videoId}`
-                    : `https://shsnews.live/?v=${videoId}`;
-                  const thumbnailUrl = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
-                  const sent = await osPost(env, "https://api.onesignal.com/notifications", {
-                    app_id: env.ONESIGNAL_APP_ID,
-                    included_segments: ["All"],
-                    headings: { en: isLive ? "🔴 Spartan News is live" : "New Spartan News upload" },
-                    contents: { en: `${videoTitle} — Watch now` },
-                    url: targetUrl,
-                    web_url: targetUrl,
-                    app_url: targetUrl,
-                    big_picture: thumbnailUrl,
-                    ios_attachments: { stream_thumb: thumbnailUrl },
-                    data: { type: isLive ? "youtube-live" : "youtube-upload", videoId, title: videoTitle, url: targetUrl },
-                  });
-                  if (sent.ok) {
-                    ctx.waitUntil(cache.put(marker, new Response("sent", {
-                      headers: { "Cache-Control": "public, max-age=86400" },
-                    })));
-                  } else {
-                    console.error("OneSignal YouTube notification failed:", sent.status, sent.body);
-                  }
-                }
+                await sendYoutubeNotification(env, videoId, videoTitle, isLive, ctx);
               }
             }
           }
@@ -461,6 +445,136 @@ async function fetchYouTubeApiJson(url, cacheId, maxAgeSeconds, ctx) {
   });
   ctx.waitUntil(cache.put(cacheKey, cacheResponse));
   return data;
+}
+
+async function refreshHudlLiveActivities(env, ctx) {
+  if (!env.SCHEDULE_KV) return;
+  try {
+    const current = (await loadHudlGames(env, ctx))
+      .map(game => game.startTimeMs ? game : formatGame(game))
+      .filter(Boolean)
+      .map(({ startTimeMs, ...game }) => game);
+    const previous = await env.SCHEDULE_KV.get("hudl_live_state", "json") || [];
+    await publishChanges(env, previous, current, false);
+    await env.SCHEDULE_KV.put("hudl_live_state", JSON.stringify(current));
+  } catch (err) {
+    console.error("Scheduled Hudl Live Activity refresh failed:", err);
+  }
+}
+
+async function refreshYouTubeLiveNotification(env, ctx) {
+  const apiKey = env.YOUTUBE_API_KEY || env.VITE_YOUTUBE_API_KEY;
+  if (!apiKey) return;
+  try {
+    const searchUrl = new URL("https://www.googleapis.com/youtube/v3/search");
+    searchUrl.search = new URLSearchParams({
+      part: "snippet",
+      channelId: SPARTAN_LIVE_CHANNEL_ID,
+      eventType: "live",
+      maxResults: "1",
+      type: "video",
+      key: apiKey,
+    }).toString();
+    const data = await fetchYouTubeApiJson(searchUrl.toString(), `push-live-${SPARTAN_LIVE_CHANNEL_ID}`, 30, ctx);
+    const stream = data.items?.[0];
+    const currentVideoId = stream?.id?.videoId || "";
+    const stateCache = caches.default;
+    const stateKey = new Request("https://shsnews.live/__youtube_live/active_video");
+    const cachedState = await stateCache.match(stateKey);
+    const previousVideoId = env.SCHEDULE_KV
+      ? (await env.SCHEDULE_KV.get("active_youtube_live_id") || "")
+      : (cachedState ? await cachedState.text() : "");
+
+    if (currentVideoId && currentVideoId !== previousVideoId) {
+      const pushed = await sendYoutubeNotification(env, currentVideoId, stream.snippet?.title || "Spartan News Live", true, ctx);
+      if (pushed) {
+        if (env.SCHEDULE_KV) await env.SCHEDULE_KV.put("active_youtube_live_id", currentVideoId);
+        else ctx.waitUntil(stateCache.put(stateKey, new Response(currentVideoId, {
+          headers: { "Cache-Control": "public, max-age=28800" },
+        })));
+      }
+    } else if (!currentVideoId && previousVideoId) {
+      if (env.SCHEDULE_KV) await env.SCHEDULE_KV.delete("active_youtube_live_id");
+      else await stateCache.delete(stateKey);
+    }
+  } catch (err) {
+    console.error("Scheduled YouTube live notification check failed:", err);
+  }
+}
+
+async function ensureYoutubeWebhookSubscriptions(env, ctx) {
+  const apiKey = env.YOUTUBE_API_KEY || env.VITE_YOUTUBE_API_KEY;
+  if (!apiKey) return;
+  const cache = caches.default;
+  const subscriptionMarker = new Request("https://shsnews.live/__youtube_webhook/subscription-renewal");
+  if (await cache.match(subscriptionMarker)) return;
+
+  try {
+    const channelsUrl = new URL("https://www.googleapis.com/youtube/v3/channels");
+    channelsUrl.search = new URLSearchParams({
+      part: "id",
+      forHandle: "@spartannewsdaily8847",
+      key: apiKey,
+    }).toString();
+    const channels = await fetchYouTubeApiJson(channelsUrl.toString(), "daily-channel-id", 3600, ctx);
+    const channelIds = [...new Set([
+      SPARTAN_LIVE_CHANNEL_ID,
+      ...(channels.items || []).map(channel => channel.id).filter(Boolean),
+    ])];
+
+    for (const channelId of channelIds) {
+      const form = new URLSearchParams({
+        "hub.mode": "subscribe",
+        "hub.topic": `https://www.youtube.com/xml/feeds/videos.xml?channel_id=${channelId}`,
+        "hub.callback": YOUTUBE_WEBHOOK_CALLBACK,
+        "hub.verify": "async",
+        "hub.lease_seconds": "604800",
+      });
+      const response = await fetch("https://pubsubhubbub.appspot.com/subscribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: form,
+      });
+      if (!response.ok) throw new Error(`YouTube feed subscription failed (${response.status}).`);
+    }
+
+    ctx.waitUntil(cache.put(subscriptionMarker, new Response("subscribed", {
+      headers: { "Cache-Control": "public, max-age=432000" },
+    })));
+  } catch (err) {
+    console.error("YouTube PubSub subscription renewal failed:", err);
+  }
+}
+
+async function sendYoutubeNotification(env, videoId, title, isLive, ctx) {
+  if (!env.ONESIGNAL_APP_ID || !env.ONESIGNAL_REST_KEY) return false;
+  const kind = isLive ? "live" : "upload";
+  const marker = new Request(`https://shsnews.live/__youtube_notified/${videoId}/${kind}`);
+  const cache = caches.default;
+  if (await cache.match(marker)) return true;
+
+  const targetUrl = isLive ? `${SITE_URL}/live?v=${videoId}` : `${SITE_URL}/?v=${videoId}`;
+  const thumbnailUrl = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+  const sent = await osPost(env, "https://api.onesignal.com/notifications", {
+    app_id: env.ONESIGNAL_APP_ID,
+    included_segments: ["All"],
+    headings: { en: isLive ? "🔴 Spartan News is live" : "New Spartan News upload" },
+    contents: { en: `${title} — Watch now` },
+    url: targetUrl,
+    web_url: targetUrl,
+    app_url: targetUrl,
+    big_picture: thumbnailUrl,
+    ios_attachments: { stream_thumb: thumbnailUrl },
+    data: { type: isLive ? "youtube-live" : "youtube-upload", videoId, title, url: targetUrl },
+  });
+  if (!sent.ok) {
+    console.error("OneSignal YouTube notification failed:", sent.status, sent.body);
+    return false;
+  }
+  ctx.waitUntil(cache.put(marker, new Response("sent", {
+    headers: { "Cache-Control": "public, max-age=86400" },
+  })));
+  return true;
 }
 
 async function getYouTubeVideoInfo(env, videoId, ctx) {
@@ -1025,7 +1139,7 @@ async function sendAndroidLive(env, g, event, subscriptionIds) {
     event,
     event_attributes: {
       gameId: g.id,
-      title: gameLabel(g),
+      title: `${g.sport} vs ${g.opponent}`,
       opponent: g.opponent,
       sport: g.sport,
       level: g.level,
