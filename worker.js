@@ -3,6 +3,8 @@
 // =============================================================================
 
 const SITE_URL = "https://shsnews.live";
+const HUDL_GRAPHQL_URL = "https://www.hudl.com/api/public/graphql/query";
+const HUDL_SCHOOL_ID = "6979";
 
 const GAMES = [
   {
@@ -71,7 +73,7 @@ export default {
         const searchData = await fetchYouTubeApiJson(
           searchUrl.toString(),
           `streams-${eventType}-UCMbRanNiBOBeop8qZkBAwlA`,
-          isUpcomingRequest ? 3600 : 300,
+          isUpcomingRequest ? 3600 : 30,
           ctx
         );
         const searchItems = searchData.items || [];
@@ -210,22 +212,69 @@ export default {
     // -------------------------------------------------------------------------
     if (url.pathname === "/check-scores") {
       try {
-        const source = await loadRawGames(env);
+        const source = await loadHudlGames(env, ctx);
         const games = source
-          .map(formatGame)
+          .map(game => game.startTimeMs ? game : formatGame(game))
           .filter(Boolean)
-          .sort((a, b) => a.startTimeMs - b.startTimeMs)
+          .sort(sortScoreboardGames)
           .map(({ startTimeMs, ...game }) => game);
 
-        return new Response(JSON.stringify({ games }), {
-          headers: {
-            ...corsHeaders,
-            "Content-Type": "application/json",
-            "Cache-Control": "public, max-age=10",
-          },
+        return json({ games, source: "hudl" }, 200, {
+          ...corsHeaders,
+          "Cache-Control": "public, max-age=10",
         });
       } catch (err) {
-        return json({ error: `Schedule error: ${err.message}`, games: [] }, 500, corsHeaders);
+        console.error("Hudl schedule fetch failed; using manual schedule:", err);
+        try {
+          const games = (await loadRawGames(env))
+            .map(formatGame)
+            .filter(Boolean)
+            .sort(sortScoreboardGames)
+            .map(({ startTimeMs, ...game }) => game);
+          return json({ games, source: "manual", warning: "Hudl data is temporarily unavailable." }, 200, {
+            ...corsHeaders,
+            "Cache-Control": "public, max-age=10",
+          });
+        } catch (fallbackError) {
+          return json({ error: `Schedule error: ${fallbackError.message}`, games: [], source: "unavailable" }, 500, corsHeaders);
+        }
+      }
+    }
+
+    if (url.pathname === "/hudl-highlights") {
+      if (request.method !== "GET") return json({ error: "GET only", items: [] }, 405, corsHeaders);
+      try {
+        const requestedLimit = Number.parseInt(url.searchParams.get("limit") || "12", 10);
+        const limit = Math.min(30, Math.max(1, Number.isFinite(requestedLimit) ? requestedLimit : 12));
+        const teams = await loadHudlTeams(ctx);
+        const teamIds = teams.map(team => `"${team.id}"`).join(",");
+        const query = `query { publishedHighlights(teamIds: [${teamIds}], ownerType: TEAM, first: ${limit}) {
+          nodes { id internalId title createdAt owner { teamId } poster { renditions { width height url } } }
+          pageInfo { endCursor hasNextPage }
+        } }`;
+        const data = await fetchHudlGraphQL(query, `sparta-highlights-${limit}`, 900, ctx);
+        const nodes = data.publishedHighlights && data.publishedHighlights.nodes;
+        if (!Array.isArray(nodes)) throw new Error("Hudl returned an invalid highlights response.");
+        const teamById = new Map(teams.map(team => [team.id, team]));
+        const items = nodes.map(highlight => {
+          const team = teamById.get(highlight.owner && highlight.owner.teamId);
+          const renditions = highlight.poster && Array.isArray(highlight.poster.renditions) ? highlight.poster.renditions : [];
+          const poster = [...renditions].sort((a, b) => (b.width * b.height) - (a.width * a.height))[0];
+          const internalTeamId = decodeHudlInternalId(team && team.id);
+          const teamSlug = String((team && team.name) || "Sparta").trim().replace(/[^A-Za-z0-9]+/g, "-").replace(/^-|-$/g, "");
+          return {
+            id: highlight.internalId || highlight.id,
+            title: highlight.title || "Sparta highlight",
+            createdAt: highlight.createdAt || null,
+            thumbnail: poster && poster.url || null,
+            team: team && team.name || "Sparta Athletics",
+            url: internalTeamId ? `https://fan.hudl.com/usa/mi/sparta/organization/${HUDL_SCHOOL_ID}/sparta-high-school/team/${internalTeamId}/${teamSlug}/video` : `https://fan.hudl.com/usa/mi/sparta/organization/${HUDL_SCHOOL_ID}/sparta-high-school/video`,
+          };
+        });
+        return json({ items, source: "hudl" }, 200, { ...corsHeaders, "Cache-Control": "public, max-age=300" });
+      } catch (err) {
+        console.error("Hudl highlights fetch failed:", err);
+        return json({ error: "Unable to load Hudl highlights.", details: err.message, items: [] }, 502, corsHeaders);
       }
     }
 
@@ -309,13 +358,14 @@ export default {
       }
 
       try {
-        const game = sanitizeGames(await loadRawGames(env)).find((g) => g.id === gameId);
+        let game = (await loadHudlGames(env, ctx).catch(() => [])).find((g) => g.id === gameId);
+        if (!game) game = sanitizeGames(await loadRawGames(env)).find((g) => g.id === gameId);
         if (!game) return json({ error: "Game not found" }, 404, corsHeaders);
 
         const pins = await getPins(env, gameId);
 
         if (url.pathname === "/pin") {
-          if (game.status !== "live") {
+          if (game.status !== "live" && !game.isLive) {
             return json({ error: "This game is not live right now." }, 409, corsHeaders);
           }
           if (!pins.includes(subscriptionId)) pins.push(subscriptionId);
@@ -492,6 +542,224 @@ async function loadRawGames(env) {
     }
   }
   return GAMES;
+}
+
+async function loadHudlGames(env, ctx) {
+  const activeTeams = await loadHudlTeams(ctx);
+  if (!activeTeams.length) throw new Error("Hudl returned no current Sparta teams.");
+
+  const teamIds = activeTeams.map(team => `"${team.id}"`).join(",");
+  const startDate = new Date(Date.now() - 120 * 24 * 60 * 60 * 1000).toISOString();
+  const endDate = new Date(Date.now() + 300 * 24 * 60 * 60 * 1000).toISOString();
+  const scheduleQuery = `query { scheduleEntryPublicSummaries(input: {
+    teamIds: [${teamIds}]
+    filterStartDate: "${startDate}"
+    filterEndDate: "${endDate}"
+    first: 300
+    sortByAscending: true
+    sortType: SCHEDULE_ENTRY_DATE
+  }) {
+    items {
+      scheduleEntryId teamId timeUtc sportId scheduleEntryLocation scheduleEntryOutcome
+      score1 score2 isTimeTba broadcastStatus opponentDetails { name }
+    }
+    pageInfo { endCursor hasNextPage }
+  } }`;
+  const scheduleData = await fetchHudlGraphQL(scheduleQuery, "sparta-schedule", 15, ctx);
+  const items = scheduleData.scheduleEntryPublicSummaries && scheduleData.scheduleEntryPublicSummaries.items;
+  if (!Array.isArray(items)) throw new Error("Hudl returned an invalid schedule.");
+
+  const teamById = new Map(activeTeams.map(team => [team.id, team]));
+  const entries = [...items];
+  const pageInfo = scheduleData.scheduleEntryPublicSummaries.pageInfo;
+  let cursor = pageInfo && pageInfo.endCursor;
+  let page = 1;
+  while (pageInfo && pageInfo.hasNextPage && cursor && page < 5) {
+    const nextQuery = `query { scheduleEntryPublicSummaries(input: {
+      teamIds: [${teamIds}]
+      filterStartDate: "${startDate}"
+      filterEndDate: "${endDate}"
+      first: 300
+      after: "${cursor}"
+      sortByAscending: true
+      sortType: SCHEDULE_ENTRY_DATE
+    }) { items { scheduleEntryId teamId timeUtc sportId scheduleEntryLocation scheduleEntryOutcome score1 score2 isTimeTba broadcastStatus opponentDetails { name } } pageInfo { endCursor hasNextPage } } }`;
+    const nextData = await fetchHudlGraphQL(nextQuery, `sparta-schedule-${page}`, 15, ctx);
+    const result = nextData.scheduleEntryPublicSummaries;
+    if (!result || !Array.isArray(result.items)) break;
+    entries.push(...result.items);
+    cursor = result.pageInfo && result.pageInfo.endCursor;
+    pageInfo.hasNextPage = result.pageInfo && result.pageInfo.hasNextPage;
+    page++;
+  }
+
+  const stored = env.SCHEDULE_KV ? await env.SCHEDULE_KV.get("games", "json") : null;
+  const manualGames = Array.isArray(stored) ? sanitizeGames(stored) : [];
+  const usedManualIds = new Set();
+  const games = entries
+    .map(entry => {
+      const team = teamById.get(entry.teamId);
+      if (!team) return null;
+      const opponent = entry.opponentDetails && entry.opponentDetails.name;
+      const start = new Date(entry.timeUtc);
+      if (!opponent || !Number.isFinite(start.getTime())) return null;
+      const localDate = start.toLocaleDateString("en-CA", { timeZone: "America/Detroit" });
+      const manual = manualGames.find(game => {
+        const manualDate = game.date.slice(0, 10);
+        const manualLevel = canonicalGameLevel(game.level);
+        const hudlLevel = canonicalGameLevel(team.teamLevel);
+        const manualOpponent = canonicalGameText(game.opponent);
+        const hudlOpponent = canonicalGameText(opponent);
+        return !usedManualIds.has(game.id) &&
+          canonicalGameText(game.sport) === canonicalGameText(team.sport) &&
+          (manualOpponent === hudlOpponent || manualOpponent.startsWith(hudlOpponent) || hudlOpponent.startsWith(manualOpponent)) &&
+          (!manualLevel || !hudlLevel || manualLevel === hudlLevel) &&
+          manualDate === localDate;
+      });
+      if (manual) usedManualIds.add(manual.id);
+      return formatHudlGame(entry, team, manual);
+    })
+    .filter(Boolean);
+
+  for (const manual of manualGames) {
+    if (!usedManualIds.has(manual.id)) games.push(manual);
+  }
+  return games;
+}
+
+async function loadHudlTeams(ctx) {
+  const schoolId = btoa(`School:${HUDL_SCHOOL_ID}`);
+  const schoolQuery = `query { school(schoolId: "${schoolId}") {
+    teamHeaders { id name gender sport teamLevel currentSeason { year } }
+  } }`;
+  const schoolData = await fetchHudlGraphQL(schoolQuery, "sparta-school-teams", 21600, ctx);
+  const teams = schoolData.school && Array.isArray(schoolData.school.teamHeaders)
+    ? schoolData.school.teamHeaders
+    : [];
+  const currentYear = new Date().getUTCFullYear();
+  const activeTeams = teams.filter(team => team.currentSeason && Number(team.currentSeason.year) >= currentYear - 1);
+  if (!activeTeams.length) throw new Error("Hudl returned no current Sparta teams.");
+  return activeTeams;
+}
+
+async function fetchHudlGraphQL(query, cacheId, maxAgeSeconds, ctx) {
+  const cache = caches.default;
+  const cacheKey = new Request(`https://shsnews.live/__hudl_cache/${encodeURIComponent(cacheId)}`);
+  const cached = await cache.match(cacheKey);
+  if (cached) {
+    const payload = await cached.json();
+    if (payload && !payload.errors) return payload.data;
+  }
+
+  const response = await fetch(HUDL_GRAPHQL_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Origin: "https://fan.hudl.com",
+      Referer: "https://fan.hudl.com/",
+    },
+    body: JSON.stringify({ query }),
+  });
+  const payload = await response.json();
+  if (!response.ok || !payload || payload.errors || !payload.data) {
+    const message = payload && payload.errors && payload.errors[0] && payload.errors[0].message;
+    throw new Error(message || `Hudl returned status ${response.status}.`);
+  }
+
+  const cacheResponse = new Response(JSON.stringify(payload), {
+    headers: { "Content-Type": "application/json", "Cache-Control": `public, max-age=${maxAgeSeconds}` },
+  });
+  ctx.waitUntil(cache.put(cacheKey, cacheResponse));
+  return payload.data;
+}
+
+function canonicalGameText(value) {
+  return String(value || "").toLowerCase().replace(/high school/g, "").replace(/[^a-z0-9]/g, "");
+}
+
+function canonicalGameLevel(value) {
+  const level = canonicalGameText(value);
+  if (level === "juniorvarsity") return "jv";
+  if (level === "freshmen") return "freshman";
+  return level;
+}
+
+function sortScoreboardGames(a, b) {
+  if (a.isLive !== b.isLive) return a.isLive ? -1 : 1;
+  if (a.isFuture !== b.isFuture) return a.isFuture ? -1 : 1;
+  return a.isFuture ? a.startTimeMs - b.startTimeMs : b.startTimeMs - a.startTimeMs;
+}
+
+function decodeHudlInternalId(value) {
+  if (!value) return "";
+  try {
+    return atob(value).replace(/^[A-Za-z]+/, "").replace(/[^0-9]/g, "");
+  } catch (e) {
+    return "";
+  }
+}
+
+function formatHudlGame(entry, team, manualOverride) {
+  const start = new Date(entry.timeUtc);
+  const now = Date.now();
+  const outcome = Number(entry.scheduleEntryOutcome || 0);
+  const score1 = Number.isFinite(Number(entry.score1)) ? Number(entry.score1) : 0;
+  const score2 = Number.isFinite(Number(entry.score2)) ? Number(entry.score2) : 0;
+  const broadcastStatus = String(entry.broadcastStatus || "").toLowerCase();
+  const explicitLive = ["live", "onair", "on air", "inprogress", "in progress"].includes(broadcastStatus);
+  const startedRecently = now >= start.getTime() && now - start.getTime() < 4 * 60 * 60 * 1000;
+  const manualLive = manualOverride && manualOverride.status === "live";
+  const manualFinal = manualOverride && manualOverride.status === "final";
+  const isLive = !manualFinal && (manualLive || explicitLive || (startedRecently && outcome === 0 && entry.score1 != null && entry.score2 != null));
+  const isCompleted = manualFinal || (!manualLive && outcome > 0);
+  const isFuture = !isLive && !isCompleted && start.getTime() > now;
+  if (!isLive && !isCompleted && !isFuture && now - start.getTime() >= 4 * 60 * 60 * 1000 && entry.score1 == null && entry.score2 == null) return null;
+  const isHome = Number(entry.scheduleEntryLocation) !== 2;
+  const opponent = String(entry.opponentDetails.name).trim();
+  const spartanScore = manualOverride && manualOverride.status !== "scheduled" ? manualOverride.spartanScore : score1;
+  const opponentScore = manualOverride && manualOverride.status !== "scheduled" ? manualOverride.opponentScore : score2;
+  const startTimeMs = start.getTime();
+  const formattedDate = start.toLocaleDateString("en-US", {
+    weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZone: "America/Detroit",
+  });
+  let id = entry.scheduleEntryId;
+  try {
+    id = atob(id).replace(/[^A-Za-z0-9_-]/g, "");
+  } catch (e) {}
+  const gameId = `hudl-${id}`.slice(0, 64);
+  const level = String(team.teamLevel || "").replaceAll("_", " ").toLowerCase().replace(/\b\w/g, letter => letter.toUpperCase());
+  const sport = String(team.sport || "Sports").replaceAll("_", " ");
+  const gender = String(team.gender || "").toUpperCase() === "WOMENS" ? "Girls" : "Boys";
+  const homeName = isHome ? "Spartans" : opponent;
+  const awayName = isHome ? opponent : "Spartans";
+  const homeScore = isHome ? spartanScore : opponentScore;
+  const awayScore = isHome ? opponentScore : spartanScore;
+  const finalStatus = isLive ? "IN_PROGRESS" : isCompleted ? "FINAL" : "SCHEDULED";
+  const overrideClock = manualOverride && manualOverride.status === "live" ? manualOverride.clock : "";
+
+  return {
+    id: gameId,
+    date: start.toISOString(),
+    startTimeMs,
+    sport: sport.toUpperCase(),
+    level,
+    gender,
+    opponent,
+    home: isHome,
+    location: entry.scheduleEntryLocation === 2 ? `AT ${opponent}` : "Spartan Stadium / Gym",
+    status: finalStatus,
+    isLive,
+    isFuture,
+    spartanScore,
+    opponentScore,
+    clock: overrideClock || (isLive ? "IN PROGRESS" : isCompleted ? "FINAL" : ""),
+    homeTeam: { name: homeName, score: homeScore, logo: null },
+    awayTeam: { name: awayName, score: awayScore, logo: null },
+    gameClock: isFuture ? formattedDate : isCompleted ? "FINAL" : overrideClock || "IN PROGRESS",
+    period: "",
+    venue: entry.scheduleEntryLocation === 2 ? `AT ${opponent}` : "Spartan Stadium / Gym",
+    topPlayers: [],
+  };
 }
 
 function sanitizeGames(list) {
