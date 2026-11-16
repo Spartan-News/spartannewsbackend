@@ -5,6 +5,8 @@
 const SITE_URL = "https://shsnews.live";
 const HUDL_GRAPHQL_URL = "https://www.hudl.com/api/public/graphql/query";
 const HUDL_SCHOOL_ID = "6979";
+const GOOGLE_CALENDAR_ID = "fce03f2af58e6d303b610da3df6e39245d0e7e8a4bbbe0ce5655d48cfd807584@group.calendar.google.com";
+const SPARTAN_LIVE_CHANNEL_ID = "UCMbRanNiBOBeop8qZkBAwlA";
 
 const GAMES = [
   {
@@ -41,9 +43,26 @@ export default {
     }
 
     // -------------------------------------------------------------------------
-    // 1. YOUTUBE LIVE STATUS AND UPCOMING STREAMS
+    // 1. GOOGLE CALENDAR UPCOMING STREAMS
     // -------------------------------------------------------------------------
-    if (url.pathname === "/check-live" || url.pathname === "/upcoming-streams") {
+    if (url.pathname === "/upcoming-streams") {
+      if (request.method !== "GET") return json({ error: "GET only" }, 405, corsHeaders);
+      try {
+        const items = await fetchCalendarEvents(ctx);
+        return json({ items, source: "google-calendar" }, 200, {
+          ...corsHeaders,
+          "Cache-Control": "public, max-age=60",
+        });
+      } catch (err) {
+        console.error("Google Calendar schedule fetch failed:", err);
+        return json({ error: err.message || "Unable to fetch the Google Calendar schedule.", items: [] }, 502, corsHeaders);
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // 2. YOUTUBE LIVE STATUS
+    // -------------------------------------------------------------------------
+    if (url.pathname === "/check-live") {
       if (request.method !== "GET") return json({ error: "GET only" }, 405, corsHeaders);
 
       const handle = (url.searchParams.get("handle") || "SpartanNewsLive").replace(/^@/, "");
@@ -57,13 +76,11 @@ export default {
       }
 
       try {
-        const isUpcomingRequest = url.pathname === "/upcoming-streams";
-        const eventType = isUpcomingRequest ? "upcoming" : "live";
         const searchUrl = new URL("https://www.googleapis.com/youtube/v3/search");
         searchUrl.search = new URLSearchParams({
           part: "snippet",
           channelId: "UCMbRanNiBOBeop8qZkBAwlA",
-          eventType,
+          eventType: "live",
           maxResults: "25",
           type: "video",
           videoEmbeddable: "true",
@@ -72,78 +89,24 @@ export default {
 
         const searchData = await fetchYouTubeApiJson(
           searchUrl.toString(),
-          `streams-${eventType}-UCMbRanNiBOBeop8qZkBAwlA`,
-          isUpcomingRequest ? 3600 : 30,
+          "streams-live-UCMbRanNiBOBeop8qZkBAwlA",
+          30,
           ctx
         );
         const searchItems = searchData.items || [];
-
-        if (!isUpcomingRequest) {
-          const stream = searchItems[0];
-          return json(
-            {
-              isLive: Boolean(stream),
-              videoId: stream ? stream.id.videoId : null,
-              title: stream ? stream.snippet.title : "",
-            },
-            200,
-            { ...corsHeaders, "Cache-Control": "public, max-age=30" }
-          );
-        }
-
-        const videoIds = searchItems
-          .map((item) => item.id && item.id.videoId)
-          .filter(Boolean);
-
-        if (!videoIds.length) {
-          return json({ items: [] }, 200, { ...corsHeaders, "Cache-Control": "public, max-age=60" });
-        }
-
-        const detailsUrl = new URL("https://www.googleapis.com/youtube/v3/videos");
-        detailsUrl.search = new URLSearchParams({
-          part: "liveStreamingDetails",
-          id: videoIds.join(","),
-          key: apiKey,
-        }).toString();
-        const detailsData = await fetchYouTubeApiJson(
-          detailsUrl.toString(),
-          `stream-details-${videoIds.sort().join(",")}`,
-          3600,
-          ctx
+        const stream = searchItems[0];
+        return json(
+          {
+            isLive: Boolean(stream),
+            videoId: stream ? stream.id.videoId : null,
+            title: stream ? stream.snippet.title : "",
+          },
+          200,
+          { ...corsHeaders, "Cache-Control": "public, max-age=30" }
         );
-        const startTimes = new Map(
-          (detailsData.items || []).map((video) => [
-            video.id,
-            video.liveStreamingDetails && video.liveStreamingDetails.scheduledStartTime,
-          ])
-        );
-        const now = Date.now();
-        const items = searchItems
-          .map((item) => {
-            const scheduledStartTime = startTimes.get(item.id.videoId);
-            if (!scheduledStartTime || Date.parse(scheduledStartTime) <= now) return null;
-
-            return {
-              id: item.id.videoId,
-              title: item.snippet.title,
-              scheduledStartTime,
-              scheduledTime: new Intl.DateTimeFormat("en-US", {
-                weekday: "short",
-                month: "short",
-                day: "numeric",
-                hour: "numeric",
-                minute: "2-digit",
-                timeZone: "America/Detroit",
-              }).format(new Date(scheduledStartTime)),
-            };
-          })
-          .filter(Boolean)
-          .sort((a, b) => Date.parse(a.scheduledStartTime) - Date.parse(b.scheduledStartTime));
-
-        return json({ items }, 200, { ...corsHeaders, "Cache-Control": "public, max-age=60" });
       } catch (err) {
-        console.error("YouTube live data request failed:", err);
-        return json({ error: err.message || "YouTube live data request failed" }, 502, corsHeaders);
+        console.error("YouTube live status request failed:", err);
+        return json({ error: err.message || "YouTube live status request failed" }, 502, corsHeaders);
       }
     }
 
@@ -248,27 +211,46 @@ export default {
         const limit = Math.min(30, Math.max(1, Number.isFinite(requestedLimit) ? requestedLimit : 12));
         const teams = await loadHudlTeams(ctx);
         const teamIds = teams.map(team => `"${team.id}"`).join(",");
-        const query = `query { publishedHighlights(teamIds: [${teamIds}], ownerType: TEAM, first: ${limit}) {
-          nodes { id internalId title createdAt owner { teamId } poster { renditions { width height url } } }
-          pageInfo { endCursor hasNextPage }
+        const schoolId = btoa(`School:${HUDL_SCHOOL_ID}`);
+        const query = `query { highlightReelSummaries(input: {
+          schoolIds: ["${schoolId}"]
+          teamIds: [${teamIds}]
+          first: ${limit}
+          sortByAscending: false
+          sortType: HIGHLIGHT_CREATION_DATE
+          includeDeleted: false
+          includeDrafts: false
+          overridePrivacy: false
+          excludePrivateTeamHighlights: true
+          usePrimary: false
+        }) {
+          edges { node {
+            id internalId title createdAt duration videoUrl thumbnail ownerId ownerType
+            teamInfo { teamId }
+          } }
+          totalCount
         } }`;
-        const data = await fetchHudlGraphQL(query, `sparta-highlights-${limit}`, 900, ctx);
-        const nodes = data.publishedHighlights && data.publishedHighlights.nodes;
+        const data = await fetchHudlGraphQL(query, `sparta-highlight-reels-${limit}`, 900, ctx);
+        const edges = data.highlightReelSummaries && data.highlightReelSummaries.edges;
+        const nodes = Array.isArray(edges) ? edges.map(edge => edge.node).filter(Boolean) : null;
         if (!Array.isArray(nodes)) throw new Error("Hudl returned an invalid highlights response.");
         const teamById = new Map(teams.map(team => [team.id, team]));
         const items = nodes.map(highlight => {
-          const team = teamById.get(highlight.owner && highlight.owner.teamId);
-          const renditions = highlight.poster && Array.isArray(highlight.poster.renditions) ? highlight.poster.renditions : [];
-          const poster = [...renditions].sort((a, b) => (b.width * b.height) - (a.width * a.height))[0];
+          const teamInfo = Array.isArray(highlight.teamInfo) ? highlight.teamInfo[0] : null;
+          const team = teamById.get(teamInfo && teamInfo.teamId);
           const internalTeamId = decodeHudlInternalId(team && team.id);
           const teamSlug = String((team && team.name) || "Sparta").trim().replace(/[^A-Za-z0-9]+/g, "-").replace(/^-|-$/g, "");
+          const hudlWatchUrl = `https://fan.hudl.com/usa/mi/sparta/organization/${HUDL_SCHOOL_ID}/sparta-high-school/watch?hr=${encodeURIComponent(highlight.id)}&oi=${encodeURIComponent(highlight.ownerId || internalTeamId)}&ot=${encodeURIComponent(highlight.ownerType || "TEAM")}`;
           return {
             id: highlight.internalId || highlight.id,
             title: highlight.title || "Sparta highlight",
             createdAt: highlight.createdAt || null,
-            thumbnail: poster && poster.url || null,
+            duration: highlight.duration || null,
+            thumbnail: highlight.thumbnail || null,
+            videoUrl: highlight.videoUrl || null,
             team: team && team.name || "Sparta Athletics",
-            url: internalTeamId ? `https://fan.hudl.com/usa/mi/sparta/organization/${HUDL_SCHOOL_ID}/sparta-high-school/team/${internalTeamId}/${teamSlug}/video` : `https://fan.hudl.com/usa/mi/sparta/organization/${HUDL_SCHOOL_ID}/sparta-high-school/video`,
+            url: hudlWatchUrl,
+            teamUrl: internalTeamId ? `https://fan.hudl.com/usa/mi/sparta/organization/${HUDL_SCHOOL_ID}/sparta-high-school/team/${internalTeamId}/${teamSlug}/video` : `https://fan.hudl.com/usa/mi/sparta/organization/${HUDL_SCHOOL_ID}/sparta-high-school/video`,
           };
         });
         return json({ items, source: "hudl" }, 200, { ...corsHeaders, "Cache-Control": "public, max-age=300" });
@@ -400,30 +382,46 @@ export default {
             const titleMatch = entryXml.match(/<title>(.*?)<\/title>/);
 
             const videoId = videoIdMatch ? videoIdMatch[1] : null;
-            const videoTitle = titleMatch ? decodeXml(titleMatch[1]) : "Spartan News Live Stream";
-            const thumbnailUrl = videoId ? `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg` : null;
-            const targetUrl = `https://shsnews.live/live?v=${videoId}`;
-
+            const videoTitle = titleMatch ? decodeXml(titleMatch[1]) : "Spartan News video";
+            const channelMatch = entryXml.match(/<yt:channelId>(.*?)<\/yt:channelId>/);
+            const channelId = channelMatch ? channelMatch[1] : "";
             if (videoId && env.ONESIGNAL_APP_ID && env.ONESIGNAL_REST_KEY) {
-              await fetch("https://onesignal.com/api/v1/notifications", {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                  Authorization: `Basic ${env.ONESIGNAL_REST_KEY}`,
-                },
-                body: JSON.stringify({
-                  app_id: env.ONESIGNAL_APP_ID,
-                  included_segments: ["All"],
-                  headings: { en: "🔴 SPARTAN NEWS IS LIVE!" },
-                  contents: { en: videoTitle },
-                  url: targetUrl,
-                  web_url: targetUrl,
-                  app_url: targetUrl,
-                  big_picture: thumbnailUrl,
-                  ios_attachments: thumbnailUrl ? { stream_thumb: thumbnailUrl } : undefined,
-                  data: { videoId, url: targetUrl },
-                }),
-              });
+              const videoInfo = await getYouTubeVideoInfo(env, videoId, ctx);
+              const isLive = videoInfo?.snippet?.liveBroadcastContent === "live" ||
+                (Boolean(videoInfo?.liveStreamingDetails?.actualStartTime) && !videoInfo?.liveStreamingDetails?.actualEndTime) ||
+                (!videoInfo && channelId === SPARTAN_LIVE_CHANNEL_ID);
+
+              // Upcoming broadcasts should alert users only once they are actually live.
+              if (videoInfo?.snippet?.liveBroadcastContent !== "upcoming") {
+                const kind = isLive ? "live" : "upload";
+                const marker = new Request(`https://shsnews.live/__youtube_notified/${videoId}/${kind}`);
+                const cache = caches.default;
+                if (!(await cache.match(marker))) {
+                  const targetUrl = isLive
+                    ? `https://shsnews.live/live?v=${videoId}`
+                    : `https://shsnews.live/?v=${videoId}`;
+                  const thumbnailUrl = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+                  const sent = await osPost(env, "https://api.onesignal.com/notifications", {
+                    app_id: env.ONESIGNAL_APP_ID,
+                    included_segments: ["All"],
+                    headings: { en: isLive ? "🔴 Spartan News is live" : "New Spartan News upload" },
+                    contents: { en: `${videoTitle} — Watch now` },
+                    url: targetUrl,
+                    web_url: targetUrl,
+                    app_url: targetUrl,
+                    big_picture: thumbnailUrl,
+                    ios_attachments: { stream_thumb: thumbnailUrl },
+                    data: { type: isLive ? "youtube-live" : "youtube-upload", videoId, title: videoTitle, url: targetUrl },
+                  });
+                  if (sent.ok) {
+                    ctx.waitUntil(cache.put(marker, new Response("sent", {
+                      headers: { "Cache-Control": "public, max-age=86400" },
+                    })));
+                  } else {
+                    console.error("OneSignal YouTube notification failed:", sent.status, sent.body);
+                  }
+                }
+              }
             }
           }
         } catch (err) {
@@ -463,6 +461,103 @@ async function fetchYouTubeApiJson(url, cacheId, maxAgeSeconds, ctx) {
   });
   ctx.waitUntil(cache.put(cacheKey, cacheResponse));
   return data;
+}
+
+async function getYouTubeVideoInfo(env, videoId, ctx) {
+  const apiKey = env.YOUTUBE_API_KEY || env.VITE_YOUTUBE_API_KEY;
+  if (!apiKey) return null;
+  try {
+    const url = new URL("https://www.googleapis.com/youtube/v3/videos");
+    url.search = new URLSearchParams({
+      part: "snippet,liveStreamingDetails",
+      id: videoId,
+      key: apiKey,
+    }).toString();
+    const data = await fetchYouTubeApiJson(url.toString(), `video-${videoId}`, 30, ctx);
+    return data.items?.[0] || null;
+  } catch (err) {
+    console.error("Unable to classify YouTube webhook video:", err);
+    return null;
+  }
+}
+
+async function fetchCalendarEvents(ctx) {
+  const calendarUrl = `https://calendar.google.com/calendar/ical/${encodeURIComponent(GOOGLE_CALENDAR_ID)}/public/basic.ics`;
+  const response = await fetch(calendarUrl, { headers: { Accept: "text/calendar" } });
+  if (!response.ok) throw new Error(`Google Calendar returned status ${response.status}.`);
+  const calendarText = await response.text();
+  if (calendarText.length > 1_000_000) throw new Error("Google Calendar response was unexpectedly large.");
+
+  // Google emits CRLF and may fold long properties. Split on VEVENT boundaries
+  // rather than matching the entire block with a line-ending-sensitive regex.
+  const unfolded = calendarText.replace(/\r?\n[ \t]/g, "");
+  const blocks = unfolded
+    .split(/BEGIN:VEVENT\r?\n/i)
+    .slice(1)
+    .map(block => block.split(/\r?\nEND:VEVENT/i, 1)[0]);
+  const now = Date.now();
+  return blocks
+    .map(event => {
+      const start = parseIcsDate(findIcsProperty(event, "DTSTART"));
+      const status = unescapeIcsText(findIcsProperty(event, "STATUS")?.value || "CONFIRMED").toUpperCase();
+      const title = unescapeIcsText(findIcsProperty(event, "SUMMARY")?.value || "Spartan News event");
+      if (!start || start.getTime() <= now || status === "CANCELLED") return null;
+
+      const uid = findIcsProperty(event, "UID")?.value;
+      const description = unescapeIcsText(findIcsProperty(event, "DESCRIPTION")?.value || "");
+      const location = unescapeIcsText(findIcsProperty(event, "LOCATION")?.value || "");
+      const eventUrl = unescapeIcsText(findIcsProperty(event, "URL")?.value || "");
+      return {
+        id: uid || `${start.getTime()}-${title}`,
+        title,
+        description,
+        location,
+        url: eventUrl,
+        scheduledStartTime: start.toISOString(),
+        scheduledTime: new Intl.DateTimeFormat("en-US", {
+          weekday: "short",
+          month: "short",
+          day: "numeric",
+          hour: "numeric",
+          minute: "2-digit",
+          timeZone: "America/New_York",
+        }).format(start),
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => Date.parse(a.scheduledStartTime) - Date.parse(b.scheduledStartTime));
+}
+
+function findIcsProperty(eventText, propertyName) {
+  const line = eventText.split(/\r?\n/).find(value =>
+    value.startsWith(`${propertyName}:`) || value.startsWith(`${propertyName};`)
+  );
+  if (!line) return null;
+  const separator = line.indexOf(":");
+  if (separator < 0) return null;
+  return { parameters: line.slice(0, separator), value: line.slice(separator + 1) };
+}
+
+function parseIcsDate(property) {
+  if (!property) return null;
+  const value = property.value;
+  let match = value.match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/);
+  if (match) return new Date(Date.UTC(+match[1], +match[2] - 1, +match[3], +match[4], +match[5], +match[6]));
+
+  match = value.match(/^(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2}))?$/);
+  if (!match) return null;
+  const localTime = `${match[1]}-${match[2]}-${match[3]} ${match[4] || "00"}:${match[5] || "00"}`;
+  const timeZone = (property.parameters.match(/TZID=([^;:]+)/) || [])[1] || "America/Detroit";
+  if (timeZone === "America/New_York" || timeZone === "America/Detroit") return parseDetroit(localTime);
+  return new Date(`${match[1]}-${match[2]}-${match[3]}T${match[4] || "00"}:${match[5] || "00"}:${match[6] || "00"}Z`);
+}
+
+function unescapeIcsText(value) {
+  return String(value || "")
+    .replace(/\\n/gi, "\n")
+    .replace(/\\,/g, ",")
+    .replace(/\\;/g, ";")
+    .replace(/\\\\/g, "\\");
 }
 
 // -----------------------------------------------------------------------------
